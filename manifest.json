@@ -2,7 +2,7 @@
 	"name": "wbhi-smart-copy",
 	"label": "WBHI Smart-copy Gear",
 	"description": "Smart copies acquisitions to PI projects, then renames original subject-name.",
-	"version": "0.1.1",
+	"version": "0.1.2",
 	"author": "Joe Wexler",
 	"maintainer": "Joe Wexler",
 	"cite": "",
@@ -20,7 +20,7 @@
 	"custom": {
 		"gear-builder": {
 			"category": "utility",
-			"image": "jbwexler/wbhi-smart-copy:0.1.1"
+			"image": "jbwexler/wbhi-smart-copy:0.1.2"
 		},
 		"flywheel": {
 			"suite": "WBHI"

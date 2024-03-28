@@ -14,6 +14,7 @@ from collections import defaultdict
 
 log = logging.getLogger(__name__)
 
+DATE_FORMAT_FW = "%Y%m%d"
 WAIT_TIMEOUT = 3600
 
 def get_hdr_fields(dicom, site):
@@ -30,15 +31,15 @@ def get_hdr_fields(dicom, site):
         hdr_fields["pi_id"], hdr_fields["sub-id"] = re.split('[^0-9a-zA-Z]', dcm_hdr["PatientName"])[:2]
     elif site == 'uci':
         hdr_fields["pi_id"] = re.split('[^0-9a-zA-Z]', dcm_hdr["PatientName"])[0]
-        hdr_fields["sub-id"] = re.split('[^0-9a-zA-Z]', dcm_hdr["PatientID"])[0]
+        hdr_fields["sub_id"] = re.split('[^0-9a-zA-Z]', dcm_hdr["PatientID"])[0]
     else:
-        hdr_fields["pi_id"], hdr_fields["sub-id"] = re.split('[^0-9a-zA-Z]', dcm_hdr["PatientName"])[:2]
+        hdr_fields["pi_id"], hdr_fields["sub_id"] = re.split('[^0-9a-zA-Z]', dcm_hdr["PatientName"])[:2]
     return hdr_fields
 
 def smart_copy(
     src_project,
     group_id: str = None,
-    tag: str = None,
+    acquisition: str = None,
     dst_project_label: str = None,
     delete_existing_project = False) -> dict:
     """Smart copy a project to a group and returns API response.
@@ -55,12 +56,14 @@ def smart_copy(
     """
     
     dst_project_path = os.path.join(group_id, dst_project_label)
-    if client.lookup(dst_project_path):
-        breakpoint()
+    try:
+        client.lookup(dst_project_path)
         if delete_existing_project:
             delete_project(dst_project_path)
         else:
             dst_project_label = dst_project_label + '_1'
+    except flywheel.rest.ApiException:
+        pass
 
     data = {
         "group_id": group_id,
@@ -68,13 +71,18 @@ def smart_copy(
         "filter": {
             "exclude_analysis": False,
             "exclude_notes": False,
-            "exclude_tags": True,
+            "exclude_tags": False,
             "include_rules": [],
             "exclude_rules": [],
         },
     }
-
-    data["filter"]["include_rules"].append(f"session.tags={tag}")
+    session = client.get_session(acquisition.session)
+    subject = client.get_subject(acquisition.parents.subject)
+    
+    data["filter"]["include_rules"].append(f"acquisition.label={acquisition.label}")
+    data["filter"]["include_rules"].append(f"session.label={session.label}")
+    data["filter"]["include_rules"].append(f"subject.label={subject.label}")
+    
     print(f'Smart copying "{src_project.label}" to "{group_id}/{dst_project_label}')
 
     return client.project_copy(src_project.id, data)
@@ -111,35 +119,52 @@ def check_smartcopy_loop(dst_project: str):
 def mv_to_project(src_project, dst_project):
     print("Moving sessions from {src_project.group.id}/{src_project.project.label} to {dst_project.group.id}/{dst_project.project.label}")
     for session in src_project.sessions.iter():
-        try:
-            session.update(project=dst_project.id)
-        except flywheel.ApiException as exc:
-            if exc.status == 422:
-                log.error(
-                    f"Session {session.subject.label}/{session.label} already exists in {dst_project.label} - Skipping"
-                )
-            else:
-                log.exception(
-                    f"Error moving subject {session.subject.label}/{session.label} from {src_project.label} to {dst_project.label}"
-                )
+        for acquisition in session.acquisitions.iter():
+            try:
+                acquisition.update(project=dst_project.id)
+            except flywheel.ApiException as exc:
+                if exc.status == 422:
+                    log.error(
+                        f"Session {session.subject.label}/{session.label}/{acquisition.label} already exists in {dst_project.label} - Skipping"
+                    )
+                else:
+                    log.exception(
+                        f"Error moving {session.subject.label}/{session.label}/{acquisition.label} from {src_project.label} to {dst_project.label}"
+                    )
         
-def check_copied_sessions_exist(session_list, pi_project):
+def check_copied_acq_exists(acquisition, pi_project):
     start_time = time.time()
-    while session_list:
-        time.sleep(5)
-        for session in session_list:
-            if pi_project.sessions.find_first(f'copy_of={session.id}'):
-                session_list.remove(session)
-        if time.time() - start_time > WAIT_TIMEOUT:
-            log.error("Wait timeout for move to complete")
-            sys.exit(-1)
+    while True:
+        time.sleep(3)
+        for session in pi_project.sessions.iter():
+            if session.acquisitions.find_first(f'copy_of={acquisition.id}'):
+                return session
+            elif time.time() - start_time > WAIT_TIMEOUT:
+                log.error("Wait timeout for move to complete")
+                sys.exit(-1)
+                
+def delete_project(project_path):
+    try: 
+        project = client.lookup(project_path)
+        client.delete_project(project.id)
+        print(f"Successfully deleted project {project_path}")
+    except flywheel.rest.ApiException:
+        print(f"Project {project_path} does not exist")
+        
+def get_first_dicom(session):
+    acq_list = session.acquisitions()
+    acq_sorted = sorted(acq_list, key=lambda d: d.timestamp)
+    if not acq_sorted:
+        return None
+    file_list = acq_sorted[0].files
+    dicom = [f for f in file_list if f.type == "dicom"][0]
+    return dicom
 
 def main():
-    file_ = gtk_context.get_input("input-file")
-    breakpoint()
-    
-    acquisition = client.get_acquisition(file_["hierarchy"]["id"])
-    project = client.get(acquisition.parents.project)
+    file_id = gtk_context.get_input("input-file")["object"]["file_id"]
+    file_ = client.get_file(file_id)
+    acquisition = client.get_acquisition(file_.parents.acquisition)
+    project = client.get_project(file_.parents.project)
     site = project.group
 
     hdr_fields = get_hdr_fields(file_, site)
@@ -151,21 +176,42 @@ def main():
             pi_id = 'other'
     else:
         pi_id = 'other'
-        
-    pi_project_path = os.path.join(site, pi_id)
-    pi_project = client.lookup(pi_project_path)
     
     # Smart copy to pi_project
-    tmp_project_label = random.choices(string.ascii_lowercase + string.digits, k=10) # Generate random tmp project label
-    tmp_project_id = smart_copy(site_project, 'tmp', to_copy_tag, tmp_project_label, True)["project_id"]
-    tmp_project = client.get_project(tmp_project_id)
-    check_smartcopy_loop(tmp_project)
-    mv_to_project(tmp_project, pi_project)
-    check_copied_sessions_exist(session_list, pi_project)
-    delete_project(os.path.join('tmp', tmp_project_label))
+    pi_project_path = os.path.join(site, pi_id)
+    try:
+        pi_project = client.lookup(pi_project_path)
+        tmp_project_label = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10)) # Generate random tmp project label
+        tmp_project_id = smart_copy(project, 'tmp', acquisition, tmp_project_label, True)["project_id"]
+        tmp_project = client.get_project(tmp_project_id)
+        check_smartcopy_loop(tmp_project)
+        mv_to_project(tmp_project, pi_project)
+        delete_project(os.path.join('tmp', tmp_project_label))
+    except flywheel.rest.ApiException:     
+        new_project_id = smart_copy(project, site, acquisition, pi_id, True)["project_id"]
+        new_project = client.get_project(new_project_id)
+        check_smartcopy_loop(new_project)
     
-    # Rename subject
+    # Move original to renamed subject
+    session = check_copied_acq_exists(acquisition, pi_project)
+    dicom = get_first_dicom(session)
+    hdr_fields_first = get_hdr_fields(dicom, site)
+    new_sub_name_fields = (
+        hdr_fields_first['pi_id'], 
+        hdr_fields_first['sub_id'],
+        hdr_fields_first['date'].strftime(DATE_FORMAT_FW),
+        "AM" if hdr_fields_first["before_noon"] else "PM"
+    )
+    new_sub_name = "%s_%s_%s_%s" % (new_sub_name_fields)
+    if len(new_sub_name) > 64:
+        new_sub_name = new_sub_name[:64]
+    print(new_sub_name)
+    #acquisition.update(subject=dst_project.id)
     
+    # Tag acquisition
+    tag = f"smart-copy-{pi_id}"
+    if tag not in acquisition.tags:
+        acquisition.add_tag(tag)
 
 if __name__ == "__main__":
     with flywheel_gear_toolkit.GearToolkitContext(fail_on_validation=False) as gtk_context:
