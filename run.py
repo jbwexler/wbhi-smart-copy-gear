@@ -12,6 +12,8 @@ import logging
 from datetime import datetime, timedelta
 from collections import defaultdict
 
+from wbhiutils import parse_dicom_hdr
+
 log = logging.getLogger(__name__)
 
 DATE_FORMAT_FW = "%Y%m%d"
@@ -22,18 +24,13 @@ def get_hdr_fields(dicom, site):
     if "file-classifier" not in dicom.tags or "header" not in dicom.info:
         return None
     dcm_hdr = dicom.reload().info["header"]["dicom"]
-
+    
     hdr_fields = {}
     hdr_fields["site"] = site
     hdr_fields["date"] = datetime.strptime(dcm_hdr["AcquisitionDate"], DATE_FORMAT_FW)
     hdr_fields["before_noon"] = float(dcm_hdr["AcquisitionTime"]) < 120000
-    if site == 'ucsb':
-        hdr_fields["pi_id"], hdr_fields["sub-id"] = re.split('[^0-9a-zA-Z]', dcm_hdr["PatientName"])[:2]
-    elif site == 'uci':
-        hdr_fields["pi_id"] = re.split('[^0-9a-zA-Z]', dcm_hdr["PatientName"])[0]
-        hdr_fields["sub_id"] = re.split('[^0-9a-zA-Z]', dcm_hdr["PatientID"])[0]
-    else:
-        hdr_fields["pi_id"], hdr_fields["sub_id"] = re.split('[^0-9a-zA-Z]', dcm_hdr["PatientName"])[:2]
+    hdr_fields["pi_id"], hdr_fields["sub-id"] = parse_dicom_hdr.parse_pi_sub(dcm_hdr, site)
+    
     return hdr_fields
 
 def smart_copy(
@@ -55,15 +52,16 @@ def smart_copy(
         dict: copy job response
     """
     
-    dst_project_path = os.path.join(group_id, dst_project_label)
-    try:
-        client.lookup(dst_project_path)
-        if delete_existing_project:
-            delete_project(dst_project_path)
-        else:
-            dst_project_label = dst_project_label + '_1'
-    except flywheel.rest.ApiException:
-        pass
+    while True:
+        dst_project_path = os.path.join(group_id, dst_project_label)
+        try:
+            client.lookup(dst_project_path)
+            if delete_existing_project:
+                delete_project(dst_project_path)
+            else:
+                dst_project_label = dst_project_label + '_1'
+        except flywheel.rest.ApiException:
+            break
 
     data = {
         "group_id": group_id,
@@ -83,7 +81,7 @@ def smart_copy(
     data["filter"]["include_rules"].append(f"session.label={session.label}")
     data["filter"]["include_rules"].append(f"subject.label={subject.label}")
     
-    print(f'Smart copying "{src_project.label}" to "{group_id}/{dst_project_label}')
+    print(f'Smart copying "{src_project.group}/{src_project.label}" to "{group_id}/{dst_project_label}')
 
     return client.project_copy(src_project.id, data)
 
@@ -125,7 +123,7 @@ def mv_to_project(src_project, dst_project):
             except flywheel.ApiException as exc:
                 if exc.status == 422:
                     log.error(
-                        f"Session {session.subject.label}/{session.label}/{acquisition.label} already exists in {dst_project.label} - Skipping"
+                        f"{session.subject.label}/{session.label}/{acquisition.label} already exists in {dst_project.label} - Skipping"
                     )
                 else:
                     log.exception(
@@ -203,9 +201,10 @@ def main():
         "AM" if hdr_fields_first["before_noon"] else "PM"
     )
     new_sub_name = "%s_%s_%s_%s" % (new_sub_name_fields)
-    if len(new_sub_name) > 64:
-        new_sub_name = new_sub_name[:64]
-    print(new_sub_name)
+    # Restrict subject label to 64 chars
+    if len(new_sub_label) > 64:
+        new_sub_label = new_sub_label[:64]
+    print(new_sub_label)
     #acquisition.update(subject=dst_project.id)
     
     # Tag acquisition
